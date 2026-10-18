@@ -339,6 +339,7 @@ resource "google_cloud_run_v2_service" "app" {
       image = var.image
       resources {
         limits = {cpu = "1", memory = "1Gi"}
+        cpu_idle = false  # the bots reply from background tasks after the webhook returns
       }
       env {
         name = "GOOGLE_CLOUD_PROJECT"

@@ -930,6 +930,25 @@ function openBatchItem(el) {
   renderCheck(b.result);
 }
 
+// A report link from the Telegram or WhatsApp bot: /app#r=<signed code>. Show it, and keep it in this person's history.
+async function openShared(token) {
+  history.replaceState(null, '', location.pathname + '#scan');
+  route('scan');
+  mood('think', 'Fetching your report…');
+  try {
+    const report = await api(`/shared/${encodeURIComponent(token)}`);
+    clearBatch(); $('#progressArea').hidden = true;
+    if (!scanTimes[report.id]) { scanTimes[report.id] = Date.now(); store.set('linkshield_scan_times', JSON.stringify(scanTimes)); }
+    renderCheck(report);
+    const saved = await api(`/shared/${encodeURIComponent(token)}/save`, { method: 'POST' });
+    if (saved.saved) { toast('Report from the chat saved to your history'); loadHistory(); }
+  } catch (e) {
+    mood('worried', "I couldn't open that report.");
+    toast(e.message);
+  }
+}
+const sharedToken = () => (location.hash.match(/^#r=([\w.-]{20,})$/) || [])[1];
+
 // Text or a file handed over by another app through the share sheet (see sw.js), or by a /?text= link.
 async function takeShared() {
   const params = new URLSearchParams(location.search);
@@ -1388,7 +1407,7 @@ async function onClick(e) {
 
 async function init() {
   route(location.hash.slice(1) || 'scan');
-  window.addEventListener('hashchange', () => route(location.hash.slice(1)));
+  window.addEventListener('hashchange', () => { const t = sharedToken(); if (t) openShared(t); else route(location.hash.slice(1)); });
   document.addEventListener('click', onClick);
   document.addEventListener('click', smoothDetails);
   // Drop a file anywhere on the page.
@@ -1438,5 +1457,6 @@ async function init() {
   initChat();
   if (caps?.demo_mode) loadPrefs();
   takeShared();
+  if (sharedToken()) openShared(sharedToken());
 }
 init();

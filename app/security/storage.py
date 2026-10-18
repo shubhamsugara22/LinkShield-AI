@@ -152,7 +152,9 @@ def _blob(uid: str, scan_id: str):
     return storage.Client().bucket(bucket).blob(f"scans/{uid}/{scan_id}.jpg")
 
 
-def save(uid: str, report: dict):
+def save(uid: str, report: dict, source: str = "website", contact: str = ""):
+    """Keep a report in this person's history. source is where the check came from (website, whatsapp or telegram);
+    contact is who sent it on a bot: their WhatsApp number or Telegram user id."""
     snapshot_b64 = (report.get("sandbox", {}).get("evidence", {}) or {}).get("screenshot_base64")
     obj = compact(report)
     if snapshot_b64 and os.getenv("EVIDENCE_BUCKET"):
@@ -163,7 +165,7 @@ def save(uid: str, report: dict):
             obj["sandbox"]["evidence"]["screenshot_saved"] = True
     db = _db()
     if db:
-        _doc(db, uid, report["id"]).set({"created_at": datetime.now(timezone.utc), "report": obj})
+        _doc(db, uid, report["id"]).set({"created_at": datetime.now(timezone.utc), "report": obj, "source": source, "contact": contact or None})
     else:
         _ensure_loaded(uid)
         history = _mem[uid]
@@ -174,9 +176,9 @@ def save(uid: str, report: dict):
             text = json.dumps(obj, ensure_ascii=False, default=str)
             if len(text) > 900_000:  # BigQuery's limit for query parameters; keep the verdict, drop the bulky evidence
                 text = json.dumps({k: obj.get(k) for k in ("id", "kind", "label", "level", "score", "summary", "language", "domain", "url", "target")}, default=str)
-            _bq("""INSERT `{ds}.history` (uid, scan_id, created_at, kind, level, score, label, report)
-                   VALUES (@uid, @id, CURRENT_TIMESTAMP(), @kind, @level, @score, @label, @report)""",
-                uid=uid, id=str(report["id"]), kind=str(obj.get("kind") or obj.get("target") or "scan"), level=str(obj.get("level") or ""),
+            _bq("""INSERT `{ds}.history` (uid, scan_id, created_at, kind, level, score, label, report, source, contact)
+                   VALUES (@uid, @id, CURRENT_TIMESTAMP(), @kind, @level, @score, @label, @report, @source, NULLIF(@contact, ''))""",
+                uid=uid, id=str(report["id"]), source=source, contact=str(contact or ""), kind=str(obj.get("kind") or obj.get("target") or "scan"), level=str(obj.get("level") or ""),
                 score=int(obj.get("score") or 0), label=str(obj.get("label") or obj.get("domain") or "")[:200], report=text)
 
 

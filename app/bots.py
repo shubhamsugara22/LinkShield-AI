@@ -1,8 +1,11 @@
 """Chat bots: forward a suspicious message or file to LinkShield on Telegram or WhatsApp and get the verdict back.
 
 Each webhook proves who is calling (Telegram's secret header, Meta's signed body) before anything is read.
-Replies are plain text with web addresses defanged, so the bot never hands back a tappable suspicious link.
+Replies are short: the verdict, one line on why, and a link that opens the full report in the LinkShield app.
+Web addresses being checked are defanged, so the bot never hands back a tappable suspicious link; the only
+tappable link is to LinkShield's own report. Every bot check is saved to that chat's history.
 """
+import asyncio
 import hashlib
 import hmac
 import json
@@ -13,8 +16,8 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 
-from .security import engine, telemetry
-from .security.api import MAX_UPLOAD_BYTES, limit
+from .security import engine, storage, telemetry
+from .security.api import MAX_UPLOAD_BYTES, limit, report_link
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/bots")
@@ -22,6 +25,9 @@ TRANSPORT = None  # replaced in tests
 TELEGRAM_MAX_FILE = 20 * 1024 * 1024  # the Bot API will not hand bots anything larger
 GRAPH = "https://graph.facebook.com/v21.0"
 MARK = {"critical": "🔴 KNOWN THREAT", "high": "🔴 HIGH RISK", "caution": "🟠 CAUTION", "low": "🟢 NO WARNING SIGNS", "unverified": "⚪ NOT VERIFIED"}
+# The one-line verdict at the top of a bot reply.
+VERDICT = {"critical": "🔴 Known threat: do not open it", "high": "🔴 Dangerous: do not open it", "caution": "🟠 Be careful: some warning signs",
+           "low": "🟢 Looks safe: no warning signs found", "unverified": "⚪ Could not check it fully: do not open it yet"}
 CLAIM_MARK = {"false": "❌ False", "misleading": "⚠️ Misleading", "true": "✅ True", "unverifiable": "❔ Unverifiable"}
 WELCOME = ("LinkShield checks things before you open them.\n\nForward me any suspicious message, link, photo, voice note or file. "
            "I open links in a sandbox, inspect files without running them, fact-check claims, and tell you what to do.\n\n"
@@ -34,8 +40,20 @@ def client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=30, transport=TRANSPORT)
 
 
+def short_reply(report: dict, link: str) -> str:
+    """The basic answer: the verdict, why in one line, the first thing to do, and the full report link."""
+    summary = report["summary"]
+    lines = [VERDICT[report["level"]], summary["headline"]]
+    if summary.get("next_steps") and report["level"] != "low":
+        lines.append(f"👉 {summary['next_steps'][0]}")
+    if link:
+        lines += ["", f"📄 Full report: {link}"]
+    lines.append("A check is not a guarantee of safety.")
+    return "\n".join(lines)[:3900]
+
+
 def format_reply(report: dict) -> str:
-    """The verdict as a short plain-text message."""
+    """The whole verdict as plain text, for when no report link can be made."""
     summary = report["summary"]
     lines = [MARK[report["level"]], summary["headline"], "", summary["explanation"]]
     if report["links"]:
@@ -53,30 +71,56 @@ def format_reply(report: dict) -> str:
     return "\n".join(lines)[:3900]
 
 
-async def run_check(uid: str, text: str, attachment) -> str:
+async def run_check(uid: str, text: str, attachment, base_url: str = "", source: str = "", contact: str = "") -> tuple[str, str]:
+    """Check what was forwarded, save it to the chat's history, and return (reply text, report link).
+    source (whatsapp or telegram) and contact (the sender's number or Telegram user id) are saved with it."""
     try:
         await limit(uid)
     except HTTPException:
-        return BUSY
+        return BUSY, ""
     try:
         report = await engine.check(text, "", attachment)
     except ValueError:
-        return WELCOME
+        return WELCOME, ""
     except Exception:
         log.exception("bot check failed")
-        return FAILED
+        return FAILED, ""
     try:
         telemetry.emit(report)
     except Exception:
         pass
-    return format_reply(report)
+    link = ""
+    try:
+        await asyncio.to_thread(storage.save, uid, report, source, contact)
+        link = report_link(base_url, uid, report["id"])
+    except Exception:
+        log.exception("bot check could not be saved")
+    return (short_reply(report, link) if link else format_reply(report)), link
+
+
+def site_url(request: Request) -> str:
+    """Where the app lives, for report links: PUBLIC_URL if set, else the address the webhook was called on."""
+    url = os.getenv("PUBLIC_URL", "").rstrip("/")
+    if url:
+        return url
+    base = str(request.base_url).rstrip("/")
+    return base if base.startswith(("http://localhost", "http://127.0.0.1", "http://testserver")) else "https://" + base.split("://", 1)[-1]
 
 
 # ───────── Telegram ─────────
 
+class TelegramError(Exception):
+    """A failed Bot API call, described without the URL: the URL carries the bot token, which must never reach the logs."""
+
+
 async def telegram_call(http: httpx.AsyncClient, method: str, **payload):
     reply = await http.post(f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/{method}", json=payload)
-    reply.raise_for_status()
+    if reply.is_error:
+        try:
+            why = reply.json().get("description", "")
+        except ValueError:
+            why = ""
+        raise TelegramError(f"Telegram {method} failed: HTTP {reply.status_code} {why}".strip())
     return reply.json().get("result")
 
 
@@ -93,7 +137,7 @@ def telegram_attachment(message: dict) -> dict | None:
     return None
 
 
-async def handle_telegram(update: dict):
+async def handle_telegram(update: dict, base_url: str = ""):
     message = update.get("message") or update.get("channel_post") or {}
     chat = (message.get("chat") or {}).get("id")
     if chat is None:
@@ -112,11 +156,15 @@ async def handle_telegram(update: dict):
             elif found:
                 info = await telegram_call(http, "getFile", file_id=found["file_id"])
                 got = await http.get(f"https://api.telegram.org/file/bot{os.environ['TELEGRAM_BOT_TOKEN']}/{info['file_path']}")
-                got.raise_for_status()
+                if got.is_error:  # the file URL carries the bot token, so the error is described without it
+                    raise TelegramError(f"Telegram file download failed: HTTP {got.status_code}")
                 attachment = (got.content[:MAX_UPLOAD_BYTES], found["name"], found["type"])
             uid = "tg-" + hashlib.sha256(str(chat).encode()).hexdigest()[:32]
-            reply = await run_check(uid, text, attachment) if (text or attachment) else "Nothing in that message could be checked."
-            await telegram_call(http, "sendMessage", chat_id=chat, text=reply + note, link_preview_options={"is_disabled": True})
+            sender = str((message.get("from") or {}).get("id") or chat)
+            reply, link = await run_check(uid, text, attachment, base_url, "telegram", sender) if (text or attachment) else ("Nothing in that message could be checked.", "")
+            extra = {"reply_markup": {"inline_keyboard": [[{"text": "📄 Open full report", "url": link}]]}} if link.startswith("https://") else {}
+            await telegram_call(http, "sendMessage", chat_id=chat, text=reply + note, link_preview_options={"is_disabled": True},
+                                reply_to_message_id=message.get("message_id"), **extra)
         except Exception:
             log.exception("telegram update failed")
             try:
@@ -133,7 +181,7 @@ async def telegram_webhook(request: Request, bg: BackgroundTasks, x_telegram_bot
     if not hmac.compare_digest(x_telegram_bot_api_secret_token or "", secret):
         raise HTTPException(401, "Unauthorized")
     # Answer straight away; Telegram resends an update that is not acknowledged quickly.
-    bg.add_task(handle_telegram, await request.json())
+    bg.add_task(handle_telegram, await request.json(), site_url(request))
     return {"ok": True}
 
 
@@ -150,7 +198,7 @@ async def whatsapp_media(http: httpx.AsyncClient, media_id: str) -> bytes:
     return got.content[:MAX_UPLOAD_BYTES]
 
 
-async def handle_whatsapp(body: dict):
+async def handle_whatsapp(body: dict, base_url: str = ""):
     async with client() as http:
         for entry in body.get("entry") or []:
             for change in entry.get("changes") or []:
@@ -171,14 +219,16 @@ async def handle_whatsapp(body: dict):
                             except ValueError:
                                 note = f"\n\nThe file {name} is too large for me to fetch, so it was NOT checked."
                         uid = "wa-" + hashlib.sha256(sender.encode()).hexdigest()[:32]
-                        reply = await run_check(uid, text.strip(), attachment) if (text.strip() or attachment) else WELCOME
+                        reply, _ = await run_check(uid, text.strip(), attachment, base_url, "whatsapp", sender) if (text.strip() or attachment) else (WELCOME, "")
                     except Exception:
                         log.exception("whatsapp message failed")
                         reply, note = FAILED, ""
                     try:
-                        sent = await http.post(f"{GRAPH}/{phone_id}/messages", headers={"Authorization": f"Bearer {os.environ['WHATSAPP_TOKEN']}"},
-                                               json={"messaging_product": "whatsapp", "to": sender, "type": "text",
-                                                     "text": {"preview_url": False, "body": (reply + note)[:4000]}})
+                        payload = {"messaging_product": "whatsapp", "to": sender, "type": "text",
+                                   "text": {"preview_url": False, "body": (reply + note)[:4000]}}
+                        if message.get("id"):
+                            payload["context"] = {"message_id": message["id"]}  # shown as a reply to what they sent
+                        sent = await http.post(f"{GRAPH}/{phone_id}/messages", headers={"Authorization": f"Bearer {os.environ['WHATSAPP_TOKEN']}"}, json=payload)
                         sent.raise_for_status()
                     except Exception:
                         log.exception("whatsapp reply failed")
@@ -207,5 +257,5 @@ async def whatsapp_webhook(request: Request, bg: BackgroundTasks, x_hub_signatur
         body = json.loads(raw)
     except ValueError:
         raise HTTPException(400, "Invalid body") from None
-    bg.add_task(handle_whatsapp, body)
+    bg.add_task(handle_whatsapp, body, site_url(request))
     return {"ok": True}

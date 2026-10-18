@@ -15,7 +15,7 @@ class FakeBigQuery:
     def __call__(self, sql, wait=False, **p):
         self.sql.append(sql.split()[0])
         if sql.startswith("INSERT"):
-            self.history.append({"uid": p["uid"], "id": p["id"], "report": p["report"]})
+            self.history.append({"uid": p["uid"], "id": p["id"], "report": p["report"], "source": p["source"], "contact": p["contact"]})
         elif sql.startswith("SELECT report"):
             return [Row(report=r["report"]) for r in self.history if r["uid"] == p["uid"]][::-1]
         elif sql.startswith("DELETE") and "scan_id" in sql:
@@ -63,6 +63,14 @@ def test_history_survives_a_restart_and_deletes_reach_bigquery(monkeypatch):
     storage.delete_all("g-1")
     restart()
     assert storage.list_reports("g-1") == [] and fake.sql.count("INSERT") == 2
+
+
+def test_each_check_records_where_it_came_from_and_who_sent_it(monkeypatch):
+    fake = setup(monkeypatch)
+    storage.save("g-1", report(1))
+    storage.save("wa-x", report(2), "whatsapp", "919876543210")
+    storage.save("tg-y", report(3), "telegram", "123456789")
+    assert [(r["source"], r["contact"]) for r in fake.history] == [("website", ""), ("whatsapp", "919876543210"), ("telegram", "123456789")]
 
 
 def test_preferences_and_notes_survive_a_restart(monkeypatch):

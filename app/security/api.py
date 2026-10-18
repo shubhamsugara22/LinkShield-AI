@@ -1,6 +1,11 @@
 """Primary LinkShield API: one check endpoint for anything a person was sent, plus history and preferences."""
 import asyncio
+import base64
+import hashlib
+import hmac
+import json
 import os
+import secrets
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -214,6 +219,63 @@ async def put_me(body: Prefs, uid: str = Depends(current_user)):
     await limit(uid, "read")
     await asyncio.to_thread(storage.set_prefs, uid, body.model_dump())
     return body
+
+
+# ───────── Report links (sent by the bots) ─────────
+# A link names one saved report and is signed, so it cannot be altered to open anyone else's report.
+_fallback_secret = secrets.token_hex(32)  # links made with it stop working when this process restarts
+
+
+def _link_secret() -> bytes:
+    return (os.getenv("REPORT_LINK_SECRET") or _fallback_secret).encode()
+
+
+def report_token(uid: str, scan_id: str) -> str:
+    body = base64.urlsafe_b64encode(json.dumps([uid, scan_id], separators=(",", ":")).encode()).decode().rstrip("=")
+    sig = base64.urlsafe_b64encode(hmac.new(_link_secret(), body.encode(), hashlib.sha256).digest()[:18]).decode()
+    return f"{body}.{sig}"
+
+
+def read_token(token: str) -> tuple[str, str] | None:
+    try:
+        body, sig = token.split(".", 1)
+        good = base64.urlsafe_b64encode(hmac.new(_link_secret(), body.encode(), hashlib.sha256).digest()[:18]).decode()
+        if not hmac.compare_digest(sig, good):
+            return None
+        uid, scan_id = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        return str(uid), str(scan_id)
+    except Exception:
+        return None
+
+
+def report_link(base_url: str, uid: str, scan_id: str) -> str:
+    return f"{base_url.rstrip('/')}/app#r={report_token(uid, scan_id)}"
+
+
+async def _shared(token: str) -> dict:
+    found = read_token(token)
+    report = await asyncio.to_thread(storage.get, *found) if found else None
+    if not report:
+        raise HTTPException(404, "This report link is not valid, or the report was deleted.")
+    return report
+
+
+@router.get("/shared/{token}")
+async def open_shared(token: str, uid: str = Depends(current_user)):
+    """The full report behind a link a bot sent."""
+    await limit(uid, "read")
+    return await _shared(token)
+
+
+@router.post("/shared/{token}/save")
+async def save_shared(token: str, bg: BackgroundTasks, uid: str = Depends(current_user)):
+    """Keep a report opened from a bot link in this person's own history too."""
+    await limit(uid, "read")
+    report = await _shared(token)
+    if await asyncio.to_thread(storage.get, uid, report["id"]):
+        return {"saved": False}
+    await asyncio.to_thread(storage.save, uid, report)
+    return {"saved": True}
 
 
 @router.post("/me/claim-guest")

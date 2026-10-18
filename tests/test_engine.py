@@ -1,3 +1,4 @@
+import json
 import asyncio
 import httpx
 import pytest
@@ -198,7 +199,8 @@ def test_telegram_bot_checks_what_is_forwarded(monkeypatch):
     monkeypatch.setenv('DISABLE_GOOGLE', '1')
     monkeypatch.delenv('SANDBOX_URL', raising=False)
     api._hits.clear()
-    update = {'message': {'chat': {'id': 77}, 'caption': 'Urgent: share the OTP to keep your account. bit.ly/x1',
+    monkeypatch.setenv('ENABLE_FIRESTORE', '0'); monkeypatch.delenv('BQ_DATASET', raising=False)
+    update = {'message': {'message_id': 5, 'chat': {'id': 77}, 'caption': 'Urgent: share the OTP to keep your account. bit.ly/x1',
                           'document': {'file_id': 'F1', 'file_name': 'invoice.pdf', 'mime_type': 'application/pdf', 'file_size': 2000}}}
     assert client.post('/api/v1/bots/telegram', json=update).status_code == 404
     monkeypatch.setenv('TELEGRAM_BOT_TOKEN', '123:abc')
@@ -218,8 +220,20 @@ def test_telegram_bot_checks_what_is_forwarded(monkeypatch):
     assert ok.status_code == 200
     paths = [p for p, _ in calls]
     assert paths == ['/bot123:abc/sendChatAction', '/bot123:abc/getFile', '/file/bot123:abc/documents/file_1.pdf', '/bot123:abc/sendMessage']
-    sent = calls[-1][1].decode('unicode_escape')
-    assert 'bit[.]ly' in sent and 'invoice.pdf' in sent and 'What to do' in sent and 'https://bit.ly' not in sent
+    sent = json.loads(calls[-1][1])
+    # A short verdict that answers the forwarded message, with a button to the full report; no tappable suspicious link.
+    assert sent['text'].splitlines()[0] in bots.VERDICT.values() and 'Full report: http://testserver/app#r=' in sent['text']
+    assert sent['reply_to_message_id'] == 5 and 'https://bit.ly' not in sent['text']
+    token = sent['text'].split('#r=')[1].split()[0]
+    # The link opens the saved report, which lists the link and the file in full ...
+    report = client.get(f'/api/v1/shared/{token}', headers=H).json()
+    assert report['links'][0]['domain'] == 'bit.ly' and report['uploads'][0]['domain'] == 'invoice.pdf'
+    # ... and keeps it in the viewer's own history, once.
+    assert client.post(f'/api/v1/shared/{token}/save', headers=H).json() == {'saved': True}
+    assert client.post(f'/api/v1/shared/{token}/save', headers=H).json() == {'saved': False}
+    assert report['id'] in [r['id'] for r in client.get('/api/v1/scans', headers=H).json()['items']]
+    # A link that was altered opens nothing.
+    assert client.get(f'/api/v1/shared/{token[:-3]}abc', headers=H).status_code == 404
 
 def test_whatsapp_webhook_requires_metas_signature(monkeypatch):
     import hashlib, hmac, json
@@ -232,7 +246,7 @@ def test_whatsapp_webhook_requires_metas_signature(monkeypatch):
     assert client.get('/api/v1/bots/whatsapp?hub.mode=subscribe&hub.verify_token=verify-me&hub.challenge=42').text == '42'
     assert client.get('/api/v1/bots/whatsapp?hub.mode=subscribe&hub.verify_token=nope&hub.challenge=42').status_code == 403
     body = json.dumps({'entry': [{'changes': [{'value': {'metadata': {'phone_number_id': 'P1'},
-            'messages': [{'from': '919999999999', 'type': 'text', 'text': {'body': 'You won a lottery! Pay the processing fee at prize-claim.top/win'}}]}}]}]}).encode()
+            'messages': [{'id': 'wamid.1', 'from': '919999999999', 'type': 'text', 'text': {'body': 'You won a lottery! Pay the processing fee at prize-claim.top/win'}}]}}]}]}).encode()
     assert client.post('/api/v1/bots/whatsapp', content=body, headers={'X-Hub-Signature-256': 'sha256=bad'}).status_code == 401
     sent = []
     def graph(request):
@@ -241,7 +255,9 @@ def test_whatsapp_webhook_requires_metas_signature(monkeypatch):
     monkeypatch.setattr(bots, 'TRANSPORT', httpx.MockTransport(graph))
     sig = 'sha256=' + hmac.new(b'app-secret', body, hashlib.sha256).hexdigest()
     assert client.post('/api/v1/bots/whatsapp', content=body, headers={'X-Hub-Signature-256': sig}).status_code == 200
-    assert sent[0][0] == '/v21.0/P1/messages' and sent[0][1]['to'] == '919999999999' and 'prize-claim[.]top' in sent[0][1]['text']['body']
+    assert sent[0][0] == '/v21.0/P1/messages' and sent[0][1]['to'] == '919999999999' and sent[0][1]['context'] == {'message_id': 'wamid.1'}
+    body = sent[0][1]['text']['body']
+    assert body.splitlines()[0] in bots.VERDICT.values() and '/app#r=' in body and 'https://prize-claim' not in body
 
 
 
@@ -287,3 +303,11 @@ def test_chat_export_checks_newest_links(monkeypatch):
     assert seen == [f"https://site{i}.example.com/page" for i in (7, 6, 5, 4, 3)]
     assert report["uploads"] == [] and any("Chat export" in n for n in report["notes"])
     assert engine.chat_export(b"just a note\nwith https://example.com", "note.txt") is None
+
+
+def test_telegram_errors_never_log_the_bot_token(monkeypatch, caplog):
+    import asyncio
+    monkeypatch.setenv('TELEGRAM_BOT_TOKEN', '123:SECRET-TOKEN')
+    monkeypatch.setattr(bots, 'TRANSPORT', httpx.MockTransport(lambda r: httpx.Response(400, json={'ok': False, 'description': 'Bad Request: chat not found'})))
+    asyncio.run(bots.handle_telegram({'message': {'chat': {'id': 1}, 'text': 'hi there'}}))
+    assert 'chat not found' in caplog.text and 'SECRET-TOKEN' not in caplog.text

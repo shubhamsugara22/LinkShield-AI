@@ -39,7 +39,10 @@ gcloud services enable bigquery.googleapis.com >/dev/null
 bq --project_id "$PROJECT" show "$PROJECT:linkshield" >/dev/null 2>&1 || bq --project_id "$PROJECT" --location "$REGION" mk --dataset "$PROJECT:linkshield" >/dev/null
 bq --project_id "$PROJECT" --location "$REGION" query --use_legacy_sql=false --quiet >/dev/null "
 CREATE TABLE IF NOT EXISTS \`$PROJECT.linkshield.history\` (uid STRING NOT NULL, scan_id STRING NOT NULL, created_at TIMESTAMP NOT NULL,
-  kind STRING, level STRING, score INT64, label STRING, report STRING) PARTITION BY DATE(created_at) CLUSTER BY uid;
+  kind STRING, level STRING, score INT64, label STRING, report STRING, source STRING, contact STRING) PARTITION BY DATE(created_at) CLUSTER BY uid;
+ALTER TABLE \`$PROJECT.linkshield.history\` ADD COLUMN IF NOT EXISTS source STRING, ADD COLUMN IF NOT EXISTS contact STRING;
+UPDATE \`$PROJECT.linkshield.history\` SET source = CASE WHEN STARTS_WITH(uid, 'wa-') THEN 'whatsapp' WHEN STARTS_WITH(uid, 'tg-') THEN 'telegram' ELSE 'website' END
+  WHERE source IS NULL;
 CREATE TABLE IF NOT EXISTS \`$PROJECT.linkshield.profiles\` (uid STRING NOT NULL, prefs STRING, chat_notes STRING, updated_at TIMESTAMP) CLUSTER BY uid;
 CREATE TABLE IF NOT EXISTS \`$PROJECT.linkshield.claims_log\` (ts TIMESTAMP, claim_id STRING, claim STRING, language STRING, verdict STRING,
   confidence FLOAT64, grounded BOOL) PARTITION BY DATE(ts);"
@@ -59,6 +62,8 @@ keep() { local v; v=$(current "$1" "$2"); [[ "$v" =~ ^[A-Za-z0-9]{40}$ ]] && ech
 TOKEN=$(keep linkshield-sandbox SANDBOX_TOKEN)
 TELEGRAM_WEBHOOK_SECRET=$(keep linkshield TELEGRAM_WEBHOOK_SECRET)
 WHATSAPP_VERIFY_TOKEN=$(keep linkshield WHATSAPP_VERIFY_TOKEN)
+REPORT_LINK_SECRET=$(keep linkshield REPORT_LINK_SECRET)  # signs the report links the bots send
+PUBLIC_URL=$(gcloud run services describe linkshield --region "$REGION" --format 'value(status.url)' 2>/dev/null || true)
 if [[ -f .env.bots ]]; then set -a; . ./.env.bots; set +a; fi
 
 echo "▸ Sandbox worker (private: callers need an identity token from inside the project)"
@@ -74,7 +79,7 @@ python3 - "$ENVFILE" <<PY
 import json, os, sys
 env = {"GOOGLE_CLOUD_PROJECT": "$PROJECT", "GOOGLE_CLOUD_LOCATION": "global", "AUTH_REQUIRED": "0", "ENABLE_FIRESTORE": "0",
        "SANDBOX_URL": "$SANDBOX", "SANDBOX_AUDIENCE": "$SANDBOX", "SANDBOX_TOKEN": "$TOKEN",
-       "TELEGRAM_WEBHOOK_SECRET": "$TELEGRAM_WEBHOOK_SECRET", "WHATSAPP_VERIFY_TOKEN": "$WHATSAPP_VERIFY_TOKEN",
+       "TELEGRAM_WEBHOOK_SECRET": "$TELEGRAM_WEBHOOK_SECRET", "WHATSAPP_VERIFY_TOKEN": "$WHATSAPP_VERIFY_TOKEN", "REPORT_LINK_SECRET": "$REPORT_LINK_SECRET", "PUBLIC_URL": "$PUBLIC_URL",
        "BQ_DATASET": "$PROJECT.linkshield", "BQ_LOCATION": "$REGION", "BQ_TABLE": "$PROJECT.linkshield.claims_log"}
 for key in ("GOOGLE_CLIENT_ID", "TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_USERNAME", "WHATSAPP_TOKEN", "WHATSAPP_APP_SECRET", "WHATSAPP_PHONE_ID", "WHATSAPP_DISPLAY_NUMBER", "VIRUSTOTAL_API_KEY"):
     if os.environ.get(key):
@@ -83,8 +88,9 @@ with open(sys.argv[1], "w") as f:
     f.write("\n".join(f"{k}: {json.dumps(v)}" for k, v in env.items()) + "\n")
 PY
 gcloud run deploy linkshield --image "$REPO/api:$TAG" --region "$REGION" \
-  --cpu 1 --memory 1Gi --concurrency 20 --min-instances 0 --max-instances 1 --timeout 300 \
-  --env-vars-file "$ENVFILE" --no-allow-unauthenticated --quiet
+  --cpu 1 --memory 1Gi --concurrency 20 --min-instances 0 --max-instances 1 --timeout 300 --no-cpu-throttling \
+  --env-vars-file "$ENVFILE" --quiet
+  # --no-allow-unauthenticated
 URL=$(gcloud run services describe linkshield --region "$REGION" --format 'value(status.url)')
 
 # Opening the site to everyone is a separate, deliberate step:
